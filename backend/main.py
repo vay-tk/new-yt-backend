@@ -39,7 +39,7 @@ tasks: Dict[str, Dict[str, Any]] = {}
 
 class DownloadRequest(BaseModel):
     url: str
-    cookies: Optional[str] = None  # base64 encoded cookies
+    cookies: Optional[str] = None
 
 class TaskStatus(BaseModel):
     task_id: str
@@ -166,6 +166,13 @@ async def process_download(task_id: str, url: str, cookies: Optional[str] = None
 @app.post("/api/download")
 async def download_video(request: DownloadRequest, background_tasks: BackgroundTasks):
     """Start video download process"""
+    # Validate and sanitize inputs
+    if not isinstance(request.url, str):
+        raise HTTPException(status_code=400, detail="URL must be a string")
+    
+    if request.cookies is not None and not isinstance(request.cookies, str):
+        raise HTTPException(status_code=400, detail="Cookies must be a string")
+    
     task_id = str(uuid.uuid4())
     
     # Initialize task
