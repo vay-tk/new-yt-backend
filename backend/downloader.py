@@ -4,8 +4,9 @@ import random
 import base64
 import tempfile
 import time
+import subprocess
+import json
 from typing import Dict, Any, Optional
-import yt_dlp
 from utils import get_random_headers, validate_file_with_ffprobe
 
 class YTDownloader:
@@ -14,9 +15,9 @@ class YTDownloader:
         self.cookies_file = "cookies.txt"
         
     def get_ydl_opts(self, cookies: Optional[str] = None) -> Dict[str, Any]:
-        """Get yt-dlp options with enhanced anti-detection measures"""
-        headers = get_random_headers()
+        """Get yt-dlp options with minimal configuration to avoid errors"""
         
+        # Use minimal, safe configuration
         opts = {
             'format': 'best[height<=720][ext=mp4]/best[ext=mp4]/best',
             'outtmpl': f'{self.temp_dir}/%(title)s.%(ext)s',
@@ -27,43 +28,32 @@ class YTDownloader:
             'writeautomaticsub': False,
             'ignoreerrors': True,
             'no_warnings': False,
-            'retries': 5,
-            'fragment_retries': 5,
-            'socket_timeout': 120,
-            'http_headers': headers,
+            'retries': 3,
+            'fragment_retries': 3,
+            'socket_timeout': 60,
             
-            # Simplified extractor args to avoid detection
+            # Minimal headers to avoid list/string issues
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            },
+            
+            # Minimal extractor args
             'extractor_args': {
                 'youtube': {
-                    'skip': ['hls', 'dash'],
                     'player_client': ['android'],
                 }
             },
             
-            # Additional options to avoid detection
+            # Basic options
             'sleep_interval': 1,
-            'max_sleep_interval': 3,
-            'sleep_interval_requests': 1,
-            'sleep_interval_subtitles': 1,
-            
-            # Use different user agents for different requests
-            'http_chunk_size': 10485760,  # 10MB chunks
+            'max_sleep_interval': 2,
             'prefer_free_formats': True,
             'youtube_include_dash_manifest': False,
-            
-            # Geo bypass attempts
-            'geo_bypass': True,
-            'geo_bypass_country': ['US', 'GB', 'CA', 'AU'],
         }
         
-        # Add cookies if provided - FIXED: Ensure proper string handling
+        # Add cookies if provided
         if cookies:
             try:
-                # Ensure cookies is a string before decoding
-                if isinstance(cookies, list):
-                    print("Warning: cookies parameter is a list, converting to string")
-                    cookies = str(cookies[0]) if cookies else ""
-                
                 if isinstance(cookies, str) and cookies.strip():
                     # Decode base64 cookies
                     decoded_cookies = base64.b64decode(cookies).decode('utf-8')
@@ -71,8 +61,6 @@ class YTDownloader:
                         f.write(decoded_cookies)
                         opts['cookiefile'] = f.name
                         print(f"Using decoded cookies from parameter")
-                else:
-                    print("Cookies parameter is empty or invalid")
             except Exception as e:
                 print(f"Failed to decode cookies: {e}")
         elif os.path.exists(self.cookies_file):
@@ -81,10 +69,92 @@ class YTDownloader:
         
         return opts
     
-    async def download(self, url: str, cookies: Optional[str] = None) -> Dict[str, Any]:
-        """Download video from URL with enhanced error handling"""
+    async def download_with_subprocess(self, url: str, cookies: Optional[str] = None) -> Dict[str, Any]:
+        """Download using yt-dlp subprocess to avoid Python integration issues"""
         try:
-            # Validate inputs - FIXED: Ensure proper type checking
+            # Build command
+            cmd = [
+                'yt-dlp',
+                '--format', 'best[height<=720][ext=mp4]/best[ext=mp4]/best',
+                '--output', f'{self.temp_dir}/%(title)s.%(ext)s',
+                '--no-playlist',
+                '--retries', '3',
+                '--fragment-retries', '3',
+                '--socket-timeout', '60',
+                '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                '--extractor-args', 'youtube:player_client=android',
+                '--prefer-free-formats',
+                '--no-youtube-include-dash-manifest',
+                url
+            ]
+            
+            # Add cookies if available
+            if cookies:
+                try:
+                    if isinstance(cookies, str) and cookies.strip():
+                        decoded_cookies = base64.b64decode(cookies).decode('utf-8')
+                        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+                            f.write(decoded_cookies)
+                            cmd.extend(['--cookies', f.name])
+                            print(f"Using decoded cookies from parameter")
+                except Exception as e:
+                    print(f"Failed to decode cookies: {e}")
+            elif os.path.exists(self.cookies_file):
+                cmd.extend(['--cookies', self.cookies_file])
+                print(f"Using cookies file: {self.cookies_file}")
+            
+            print(f"Running command: {' '.join(cmd[:10])}...")  # Don't log full command for security
+            
+            # Run subprocess
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=os.getcwd()
+            )
+            
+            stdout, stderr = await process.communicate()
+            
+            if process.returncode == 0:
+                # Find downloaded file
+                downloaded_file = None
+                for file in os.listdir(self.temp_dir):
+                    if file.endswith(('.mp4', '.webm', '.mkv', '.avi', '.mov', '.flv')):
+                        downloaded_file = os.path.join(self.temp_dir, file)
+                        break
+                
+                if downloaded_file and await validate_file_with_ffprobe(downloaded_file):
+                    return {"success": True, "file_path": downloaded_file}
+                else:
+                    return {"success": False, "error": "No valid video file found after download"}
+            else:
+                stderr_str = stderr.decode('utf-8', errors='ignore')
+                print(f"yt-dlp subprocess failed: {stderr_str}")
+                
+                # Parse common errors
+                if 'sign in to confirm' in stderr_str.lower() or 'not a bot' in stderr_str.lower():
+                    return {"success": False, "error": "YouTube is blocking requests. This video may require authentication or be geo-restricted. Try uploading cookies from a logged-in browser session."}
+                elif 'precondition check failed' in stderr_str.lower():
+                    return {"success": False, "error": "YouTube is currently blocking automated requests. Please try again later or use cookies from a logged-in session."}
+                elif 'private video' in stderr_str.lower():
+                    return {"success": False, "error": "This video is private and cannot be downloaded"}
+                elif 'video unavailable' in stderr_str.lower():
+                    return {"success": False, "error": "Video is unavailable or has been removed"}
+                elif 'http error 403' in stderr_str.lower():
+                    return {"success": False, "error": "YouTube is blocking download requests. The video may be geo-restricted or require special permissions."}
+                elif 'http error 429' in stderr_str.lower():
+                    return {"success": False, "error": "Rate limited by YouTube. Please try again later."}
+                else:
+                    return {"success": False, "error": f"Download failed: {stderr_str[:200]}"}
+                    
+        except Exception as e:
+            print(f"Subprocess download error: {e}")
+            return {"success": False, "error": f"Download process failed: {str(e)}"}
+    
+    async def download(self, url: str, cookies: Optional[str] = None) -> Dict[str, Any]:
+        """Download video from URL using subprocess method to avoid Python integration issues"""
+        try:
+            # Validate inputs
             if not isinstance(url, str):
                 return {"success": False, "error": "URL must be a string"}
             
@@ -95,125 +165,9 @@ class YTDownloader:
             # Add random delay to avoid rate limiting
             await asyncio.sleep(random.uniform(1, 3))
             
-            opts = self.get_ydl_opts(cookies)
-            
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                # Extract info first with multiple attempts
-                info = None
-                for attempt in range(3):
-                    try:
-                        print(f"Attempt {attempt + 1}: Extracting video info...")
-                        info = await asyncio.to_thread(ydl.extract_info, url, download=False)
-                        if info:
-                            break
-                    except Exception as e:
-                        error_msg = str(e).lower()
-                        print(f"Attempt {attempt + 1} failed: {error_msg}")
-                        
-                        # Check for specific YouTube errors
-                        if 'sign in to confirm' in error_msg or 'not a bot' in error_msg:
-                            return {"success": False, "error": "YouTube is blocking requests. This video may require authentication or be geo-restricted. Try uploading cookies from a logged-in browser session."}
-                        
-                        if 'precondition check failed' in error_msg:
-                            if attempt < 2:
-                                print(f"Precondition check failed, retrying with different settings...")
-                                await asyncio.sleep(random.uniform(2, 5))
-                                # Try with different extractor args
-                                opts['extractor_args']['youtube']['player_client'] = ['web']
-                                continue
-                            else:
-                                return {"success": False, "error": "YouTube is currently blocking automated requests. Please try again later or use cookies from a logged-in session."}
-                        
-                        if 'private video' in error_msg:
-                            return {"success": False, "error": "This video is private and cannot be downloaded"}
-                        
-                        if 'video unavailable' in error_msg:
-                            return {"success": False, "error": "Video is unavailable or has been removed"}
-                        
-                        if attempt == 2:  # Last attempt
-                            return {"success": False, "error": f"Failed to extract video information: {str(e)}"}
-                        
-                        await asyncio.sleep(random.uniform(3, 6))
-                
-                if not info:
-                    return {"success": False, "error": "Failed to extract video information after multiple attempts"}
-                
-                # Enhanced video validation
-                if info.get('age_limit', 0) > 0:
-                    return {"success": False, "error": "Video is age-restricted. Please provide cookies from a logged-in YouTube session."}
-                
-                if info.get('is_live'):
-                    return {"success": False, "error": "Live streams are not supported"}
-                
-                if info.get('availability') == 'private':
-                    return {"success": False, "error": "Video is private and cannot be downloaded"}
-                
-                if info.get('availability') == 'premium_only':
-                    return {"success": False, "error": "Video requires YouTube Premium"}
-                
-                # Check for login requirements
-                title = info.get('title', '').lower()
-                if any(keyword in title for keyword in ['login', 'sign in', 'private']):
-                    return {"success": False, "error": "Video may require login. Try providing cookies."}
-                
-                # Download the video with retry logic
-                download_success = False
-                for attempt in range(3):
-                    try:
-                        print(f"Download attempt {attempt + 1}...")
-                        await asyncio.to_thread(ydl.download, [url])
-                        download_success = True
-                        break
-                    except Exception as e:
-                        error_msg = str(e).lower()
-                        print(f"Download attempt {attempt + 1} failed: {error_msg}")
-                        
-                        if 'http error 403' in error_msg:
-                            if attempt < 2:
-                                print("HTTP 403 error, retrying with different settings...")
-                                await asyncio.sleep(random.uniform(5, 10))
-                                # Try with more conservative settings
-                                opts['format'] = 'worst[ext=mp4]/worst'
-                                opts['http_chunk_size'] = 1048576  # 1MB chunks
-                                continue
-                            else:
-                                return {"success": False, "error": "YouTube is blocking download requests. The video may be geo-restricted or require special permissions."}
-                        
-                        if 'http error 429' in error_msg:
-                            return {"success": False, "error": "Rate limited by YouTube. Please try again later."}
-                        
-                        if attempt == 2:  # Last attempt
-                            return {"success": False, "error": f"Download failed: {str(e)}"}
-                        
-                        await asyncio.sleep(random.uniform(5, 10))
-                
-                if not download_success:
-                    return {"success": False, "error": "Download failed after multiple attempts"}
-            
-            # Find the downloaded file
-            downloaded_file = None
-            for file in os.listdir(self.temp_dir):
-                if file.endswith(('.mp4', '.webm', '.mkv', '.avi', '.mov', '.flv')):
-                    downloaded_file = os.path.join(self.temp_dir, file)
-                    break
-            
-            if not downloaded_file:
-                return {"success": False, "error": "No video file found after download"}
-            
-            # Validate the downloaded file
-            if not await validate_file_with_ffprobe(downloaded_file):
-                # Check if it's an HTML file (common with restricted videos)
-                try:
-                    with open(downloaded_file, 'r', encoding='utf-8', errors='ignore') as f:
-                        content = f.read(1000)  # Read first 1KB
-                        if '<!DOCTYPE html>' in content or '<html' in content:
-                            return {"success": False, "error": "Downloaded file is HTML instead of video. This usually means the video is geo-restricted, age-restricted, or requires login. Try providing cookies from a logged-in browser session."}
-                except:
-                    pass
-                
-                return {"success": False, "error": "Downloaded file is not a valid video"}
-            
-            return {"success": True, "file_path": downloaded_file}
+            # Use subprocess method to avoid Python integration issues
+            result = await self.download_with_subprocess(url, cookies)
+            return result
             
         except Exception as e:
             error_msg = str(e).lower()
