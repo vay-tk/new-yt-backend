@@ -32,12 +32,11 @@ class YTDownloader:
             'socket_timeout': 120,
             'http_headers': headers,
             
-            # Enhanced anti-detection measures
+            # Simplified extractor args to avoid detection
             'extractor_args': {
                 'youtube': {
                     'skip': ['hls', 'dash'],
-                    'player_client': ['android', 'web'],
-                    'player_skip': ['configs'],
+                    'player_client': ['android'],
                 }
             },
             
@@ -57,24 +56,42 @@ class YTDownloader:
             'geo_bypass_country': ['US', 'GB', 'CA', 'AU'],
         }
         
-        # Add cookies if provided
+        # Add cookies if provided - FIXED: Ensure proper string handling
         if cookies:
             try:
-                # Decode base64 cookies
-                decoded_cookies = base64.b64decode(cookies).decode('utf-8')
-                with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
-                    f.write(decoded_cookies)
-                    opts['cookiefile'] = f.name
+                # Ensure cookies is a string before decoding
+                if isinstance(cookies, list):
+                    print("Warning: cookies parameter is a list, converting to string")
+                    cookies = str(cookies[0]) if cookies else ""
+                
+                if isinstance(cookies, str) and cookies.strip():
+                    # Decode base64 cookies
+                    decoded_cookies = base64.b64decode(cookies).decode('utf-8')
+                    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+                        f.write(decoded_cookies)
+                        opts['cookiefile'] = f.name
+                        print(f"Using decoded cookies from parameter")
+                else:
+                    print("Cookies parameter is empty or invalid")
             except Exception as e:
                 print(f"Failed to decode cookies: {e}")
         elif os.path.exists(self.cookies_file):
             opts['cookiefile'] = self.cookies_file
+            print(f"Using cookies file: {self.cookies_file}")
         
         return opts
     
     async def download(self, url: str, cookies: Optional[str] = None) -> Dict[str, Any]:
         """Download video from URL with enhanced error handling"""
         try:
+            # Validate inputs - FIXED: Ensure proper type checking
+            if not isinstance(url, str):
+                return {"success": False, "error": "URL must be a string"}
+            
+            if cookies is not None and not isinstance(cookies, str):
+                print(f"Warning: cookies parameter type is {type(cookies)}, converting to string")
+                cookies = str(cookies) if cookies else None
+            
             # Add random delay to avoid rate limiting
             await asyncio.sleep(random.uniform(1, 3))
             
@@ -86,11 +103,12 @@ class YTDownloader:
                 for attempt in range(3):
                     try:
                         print(f"Attempt {attempt + 1}: Extracting video info...")
-                        info = ydl.extract_info(url, download=False)
+                        info = await asyncio.to_thread(ydl.extract_info, url, download=False)
                         if info:
                             break
                     except Exception as e:
                         error_msg = str(e).lower()
+                        print(f"Attempt {attempt + 1} failed: {error_msg}")
                         
                         # Check for specific YouTube errors
                         if 'sign in to confirm' in error_msg or 'not a bot' in error_msg:
@@ -101,7 +119,7 @@ class YTDownloader:
                                 print(f"Precondition check failed, retrying with different settings...")
                                 await asyncio.sleep(random.uniform(2, 5))
                                 # Try with different extractor args
-                                opts['extractor_args']['youtube']['player_client'] = ['web', 'android']
+                                opts['extractor_args']['youtube']['player_client'] = ['web']
                                 continue
                             else:
                                 return {"success": False, "error": "YouTube is currently blocking automated requests. Please try again later or use cookies from a logged-in session."}
@@ -143,11 +161,12 @@ class YTDownloader:
                 for attempt in range(3):
                     try:
                         print(f"Download attempt {attempt + 1}...")
-                        ydl.download([url])
+                        await asyncio.to_thread(ydl.download, [url])
                         download_success = True
                         break
                     except Exception as e:
                         error_msg = str(e).lower()
+                        print(f"Download attempt {attempt + 1} failed: {error_msg}")
                         
                         if 'http error 403' in error_msg:
                             if attempt < 2:
@@ -198,6 +217,7 @@ class YTDownloader:
             
         except Exception as e:
             error_msg = str(e).lower()
+            print(f"Unexpected download error: {e}")
             
             if 'network' in error_msg or 'connection' in error_msg:
                 return {"success": False, "error": "Network error. Please check your internet connection and try again."}
