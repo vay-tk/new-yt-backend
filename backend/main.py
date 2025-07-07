@@ -152,12 +152,13 @@ async def process_download(task_id: str, url: str, cookies: Optional[str] = None
         
     except Exception as e:
         tasks[task_id]["status"] = "failed"
-        tasks[task_id]["error"] = str(e)
+        tasks[task_id]["error"] = f"Unexpected error: {str(e)}"
         log_data["steps"].append({
             "step": "unexpected_error", 
             "timestamp": datetime.now(),
             "error": str(e)
         })
+        print(f"Unexpected error in task {task_id}: {e}")
     
     finally:
         save_task_log(task_id, log_data)
