@@ -12,6 +12,7 @@ def setup_directories():
 
 def get_random_headers() -> Dict[str, str]:
     """Get random browser headers with more realistic patterns"""
+    # FIXED: Ensure all values are strings, not lists
     user_agents = [
         # Chrome on Windows
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -43,7 +44,8 @@ def get_random_headers() -> Dict[str, str]:
         'en-AU,en;q=0.9',
     ]
     
-    return {
+    # FIXED: Ensure all header values are strings
+    headers = {
         'User-Agent': random.choice(user_agents),
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
         'Accept-Language': random.choice(accept_languages),
@@ -57,6 +59,14 @@ def get_random_headers() -> Dict[str, str]:
         'Sec-Fetch-User': '?1',
         'Cache-Control': 'max-age=0',
     }
+    
+    # Double-check all values are strings
+    for key, value in headers.items():
+        if not isinstance(value, str):
+            print(f"Warning: Header {key} has non-string value: {type(value)}")
+            headers[key] = str(value)
+    
+    return headers
 
 async def validate_file_with_ffprobe(file_path: str) -> bool:
     """Validate file using ffprobe with enhanced checks"""
