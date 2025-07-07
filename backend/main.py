@@ -63,13 +63,14 @@ async def process_download(task_id: str, url: str, cookies: Optional[str] = None
         "task_id": task_id,
         "url": url,
         "started_at": datetime.now(),
+        "user_agent": "YouTube Downloader API v1.0",
         "steps": []
     }
     
     try:
         # Update status: downloading
         tasks[task_id]["status"] = "downloading"
-        tasks[task_id]["progress"] = "Starting download..."
+        tasks[task_id]["progress"] = "Connecting to YouTube..."
         log_data["steps"].append({"step": "download_start", "timestamp": datetime.now()})
         
         # Download video
