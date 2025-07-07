@@ -212,11 +212,36 @@ async def upload_cookies(file: UploadFile = File(...)):
         content = await file.read()
         cookies_path = "cookies.txt"
         
-        with open(cookies_path, 'wb') as f:
-            f.write(content)
+        # Try to decode as text first
+        try:
+            text_content = content.decode('utf-8')
+        except UnicodeDecodeError:
+            # If UTF-8 fails, try other encodings
+            try:
+                text_content = content.decode('latin-1')
+            except UnicodeDecodeError:
+                raise HTTPException(status_code=400, detail="Unable to decode cookie file. Please ensure it's a valid text file.")
         
-        return {"message": "Cookies uploaded successfully", "path": cookies_path}
+        # Validate cookies content
+        if not validate_cookies_content(text_content):
+            raise HTTPException(status_code=400, detail="Invalid cookie format. Please ensure you're uploading a valid cookies.txt file from your browser.")
+        
+        # Write cookies file
+        with open(cookies_path, 'w', encoding='utf-8') as f:
+            f.write(text_content)
+        
+        # Basic stats for user feedback
+        lines = text_content.strip().split('\n')
+        cookie_count = len([line for line in lines if line.strip() and not line.startswith('#')])
+        
+        return {
+            "message": "Cookies uploaded successfully", 
+            "path": cookies_path,
+            "cookie_count": cookie_count
+        }
     
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to upload cookies: {str(e)}")
 
@@ -229,6 +254,52 @@ async def health_check():
 async def root():
     """Root endpoint"""
     return {"message": "YouTube Video Downloader API", "version": "1.0.0"}
+
+@app.get("/api/test-cookies")
+async def test_cookies():
+    """Test if cookies file exists and is valid"""
+    try:
+        cookies_path = "cookies.txt"
+        if not os.path.exists(cookies_path):
+            return {"valid": False, "message": "No cookies file found"}
+        
+        with open(cookies_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        
+        if not validate_cookies_content(content):
+            return {"valid": False, "message": "Invalid cookie format"}
+        
+        lines = content.strip().split('\n')
+        cookie_count = len([line for line in lines if line.strip() and not line.startswith('#')])
+        
+        return {
+            "valid": True, 
+            "message": "Cookies file is valid",
+            "cookie_count": cookie_count
+        }
+    
+    except Exception as e:
+        return {"valid": False, "message": f"Error reading cookies: {str(e)}"}
+
+def validate_cookies_content(content: str) -> bool:
+    """Validate if cookies content looks valid"""
+    try:
+        # Check for common cookie patterns
+        if 'youtube.com' in content.lower() or 'google.com' in content.lower():
+            return True
+        # Check for Netscape cookie format
+        if content.strip().startswith('# Netscape HTTP Cookie File'):
+            return True
+        # Check for cookie entries (basic validation)
+        lines = content.strip().split('\n')
+        for line in lines:
+            if line.strip() and not line.startswith('#'):
+                parts = line.split('\t')
+                if len(parts) >= 6:  # Basic cookie format check
+                    return True
+        return False
+    except:
+        return False
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 10000))
