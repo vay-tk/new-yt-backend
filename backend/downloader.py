@@ -330,14 +330,28 @@ class VideoDownloader:
                 # Try browser cookies first, then file cookies
                 use_browser_cookies = retry_count == 0 and self.detected_browsers
                 ydl_opts = self.get_ydl_opts(download=True, use_browser_cookies=use_browser_cookies)
+                
+                # Progressive format fallback strategy
+                if retry_count == 0:
+                    # First attempt: Prefer MP4 with quality constraints
+                    format_selector = 'best[ext=mp4][height<=720]/best[ext=mp4][height<=1080]/best[ext=mp4]/best[height<=720]/best'
+                elif retry_count == 1:
+                    # Second attempt: Any format, prefer MP4, no height restrictions
+                    format_selector = 'best[ext=mp4]/best[vcodec!=none]/best'
+                else:
+                    # Final attempt: Accept any available format
+                    format_selector = 'best/worst'
+                
+                print(f"Download attempt {retry_count + 1}: Using format selector: {format_selector}")
+                
                 ydl_opts.update({
-                    # Prefer MP4 format for better compatibility
-                    'format': 'best[ext=mp4][height<=720]/best[height<=720][ext=mp4]/best[height<=720]/best[ext=mp4]/best',
+                    'format': format_selector,
                     'outtmpl': output_template,
                     'writesubtitles': False,
                     'writeautomaticsub': False,
                     'ignoreerrors': False,
-                    'merge_output_format': 'mp4',  # Force MP4 container
+                    'merge_output_format': 'mp4',  # Force MP4 container when merging
+                    'prefer_free_formats': False,  # Don't avoid non-free formats
                     # Enhanced retry settings
                     'retries': 5,
                     'fragment_retries': 10,
@@ -365,6 +379,13 @@ class VideoDownloader:
                             'sign in to confirm', 'not a bot'
                         ]):
                             raise Exception("YouTube is blocking automated access. Please try uploading cookies.txt file or try again later.")
+                        elif 'requested format is not available' in error_msg.lower():
+                            # Format selection issue - will retry with different strategy
+                            if retry_count < max_retries - 1:
+                                print(f"Format not available, will retry with different strategy...")
+                                raise yt_dlp.utils.DownloadError("Format not available")
+                            else:
+                                raise Exception("Video format not available. The video may have limited quality options or be unavailable for download.")
                         elif 'http error 403' in error_msg.lower():
                             raise Exception("Access forbidden. Video may be region-locked, private, or require authentication. Try uploading cookies.txt.")
                         elif 'http error 404' in error_msg.lower():
