@@ -1,306 +1,569 @@
 import os
+import sys
 import uuid
 import asyncio
+import subprocess
 import uvicorn
-from fastapi import FastAPI, HTTPException, File, UploadFile, BackgroundTasks
+import time
+from pathlib import Path
+from typing import Optional
+from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from typing import Optional, Dict, Any
-import json
-from datetime import datetime
+import aiofiles
+from dotenv import load_dotenv
+from downloader import VideoDownloader
+from utils import sanitize_filename, format_duration
 
-from downloader import YTDownloader
-from convert import VideoConverter
-from cloudinary_uploader import CloudinaryUploader
-from utils import setup_directories, cleanup_temp_files
+load_dotenv()
 
-# Initialize FastAPI app
-app = FastAPI(title="YouTube Video Downloader API", version="1.0.0")
+app = FastAPI(
+    title="YouTube HEVC Downloader API", 
+    version="1.0.0",
+    description="Convert YouTube videos to 720p HEVC format"
+)
 
-# Add CORS middleware
+# CORS configuration - Allow all origins for now, restrict in production
+FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "*")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"] if FRONTEND_ORIGIN == "*" else [FRONTEND_ORIGIN, "http://localhost:5173"],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
-# Setup directories
-setup_directories()
+# Ensure directories exist
+DOWNLOADS_DIR = Path("downloads")
+TEMP_DIR = Path("temp")
+DOWNLOADS_DIR.mkdir(exist_ok=True)
+TEMP_DIR.mkdir(exist_ok=True)
 
-# Initialize services
-downloader = YTDownloader()
-converter = VideoConverter()
-uploader = CloudinaryUploader()
+# Task storage (in production, use Redis or database)
+tasks = {}
 
-# In-memory task storage (use Redis in production)
-tasks: Dict[str, Dict[str, Any]] = {}
+# Session management to prevent rapid requests
+last_request_time = {}
+REQUEST_COOLDOWN = 120  # 2 minutes between requests from same IP
 
 class DownloadRequest(BaseModel):
     url: str
-    cookies: Optional[str] = None
+    rename: Optional[str] = None
 
-class TaskStatus(BaseModel):
-    task_id: str
+class DownloadResponse(BaseModel):
+    taskId: str
     status: str
+    message: str
+
+class StatusResponse(BaseModel):
+    status: str
+    filename: Optional[str] = None
+    message: Optional[str] = None
+    videoInfo: Optional[dict] = None
     progress: Optional[str] = None
-    error: Optional[str] = None
-    cloudinary_url: Optional[str] = None
 
-def save_task_log(task_id: str, log_data: Dict[str, Any]):
-    """Save task log to file"""
-    log_file = f"logs/{task_id}.json"
-    try:
-        with open(log_file, 'w') as f:
-            json.dump(log_data, f, indent=2, default=str)
-    except Exception as e:
-        print(f"Failed to save log for task {task_id}: {e}")
-
-async def process_download(task_id: str, url: str, cookies: Optional[str] = None):
-    """Background task to process video download"""
-    log_data = {
-        "task_id": task_id,
-        "url": url,
-        "started_at": datetime.now(),
-        "user_agent": "YouTube Downloader API v1.0",
-        "steps": []
+@app.get("/")
+async def root():
+    """Health check endpoint"""
+    return {
+        "message": "YouTube HEVC Downloader API is running", 
+        "version": "1.0.0",
+        "status": "healthy"
     }
-    
+
+@app.get("/health")
+async def health_check():
+    """Detailed health check"""
     try:
-        # Update status: downloading
-        tasks[task_id]["status"] = "downloading"
-        tasks[task_id]["progress"] = "Connecting to YouTube..."
-        log_data["steps"].append({"step": "download_start", "timestamp": datetime.now()})
+        # Test directories
+        downloads_writable = os.access(DOWNLOADS_DIR, os.W_OK)
+        temp_writable = os.access(TEMP_DIR, os.W_OK)
         
-        # Download video
-        download_result = await downloader.download(url, cookies)
-        if not download_result["success"]:
-            tasks[task_id]["status"] = "failed"
-            tasks[task_id]["error"] = download_result["error"]
-            log_data["steps"].append({
-                "step": "download_failed", 
-                "timestamp": datetime.now(),
-                "error": download_result["error"]
-            })
-            save_task_log(task_id, log_data)
-            return
-        
-        video_path = download_result["file_path"]
-        log_data["steps"].append({
-            "step": "download_success", 
-            "timestamp": datetime.now(),
-            "file_path": video_path
-        })
-        
-        # Update status: converting
-        tasks[task_id]["status"] = "converting"
-        tasks[task_id]["progress"] = "Converting video..."
-        log_data["steps"].append({"step": "convert_start", "timestamp": datetime.now()})
-        
-        # Convert video
-        convert_result = await converter.convert(video_path)
-        if not convert_result["success"]:
-            tasks[task_id]["status"] = "failed"
-            tasks[task_id]["error"] = convert_result["error"]
-            log_data["steps"].append({
-                "step": "convert_failed", 
-                "timestamp": datetime.now(),
-                "error": convert_result["error"]
-            })
-            save_task_log(task_id, log_data)
-            return
-        
-        converted_path = convert_result["file_path"]
-        log_data["steps"].append({
-            "step": "convert_success", 
-            "timestamp": datetime.now(),
-            "file_path": converted_path
-        })
-        
-        # Update status: uploading
-        tasks[task_id]["status"] = "uploading"
-        tasks[task_id]["progress"] = "Uploading to Cloudinary..."
-        log_data["steps"].append({"step": "upload_start", "timestamp": datetime.now()})
-        
-        # Upload to Cloudinary
-        upload_result = await uploader.upload(converted_path)
-        if not upload_result["success"]:
-            tasks[task_id]["status"] = "failed"
-            tasks[task_id]["error"] = upload_result["error"]
-            log_data["steps"].append({
-                "step": "upload_failed", 
-                "timestamp": datetime.now(),
-                "error": upload_result["error"]
-            })
-            save_task_log(task_id, log_data)
-            return
-        
-        # Update status: completed
-        tasks[task_id]["status"] = "completed"
-        tasks[task_id]["cloudinary_url"] = upload_result["url"]
-        tasks[task_id]["progress"] = "Completed successfully!"
-        log_data["steps"].append({
-            "step": "upload_success", 
-            "timestamp": datetime.now(),
-            "cloudinary_url": upload_result["url"]
-        })
-        log_data["completed_at"] = datetime.now()
-        
-        # Cleanup temp files
-        cleanup_temp_files([video_path, converted_path])
-        
-    except Exception as e:
-        tasks[task_id]["status"] = "failed"
-        tasks[task_id]["error"] = f"Unexpected error: {str(e)}"
-        log_data["steps"].append({
-            "step": "unexpected_error", 
-            "timestamp": datetime.now(),
-            "error": str(e)
-        })
-        print(f"Unexpected error in task {task_id}: {e}")
-    
-    finally:
-        save_task_log(task_id, log_data)
-
-@app.post("/api/download")
-async def download_video(request: DownloadRequest, background_tasks: BackgroundTasks):
-    """Start video download process"""
-    # Validate and sanitize inputs
-    if not isinstance(request.url, str):
-        raise HTTPException(status_code=400, detail="URL must be a string")
-    
-    if request.cookies is not None and not isinstance(request.cookies, str):
-        raise HTTPException(status_code=400, detail="Cookies must be a string")
-    
-    task_id = str(uuid.uuid4())
-    
-    # Initialize task
-    tasks[task_id] = {
-        "status": "pending",
-        "progress": "Initializing...",
-        "error": None,
-        "cloudinary_url": None
-    }
-    
-    # Start background task
-    background_tasks.add_task(process_download, task_id, request.url, request.cookies)
-    
-    return {"task_id": task_id, "status": "pending"}
-
-@app.get("/api/status/{task_id}")
-async def get_task_status(task_id: str):
-    """Get task status"""
-    if task_id not in tasks:
-        raise HTTPException(status_code=404, detail="Task not found")
-    
-    return TaskStatus(
-        task_id=task_id,
-        status=tasks[task_id]["status"],
-        progress=tasks[task_id]["progress"],
-        error=tasks[task_id]["error"],
-        cloudinary_url=tasks[task_id]["cloudinary_url"]
-    )
-
-@app.post("/api/upload-cookies")
-async def upload_cookies(file: UploadFile = File(...)):
-    """Upload cookies.txt file"""
-    if not file.filename.endswith('.txt'):
-        raise HTTPException(status_code=400, detail="File must be a .txt file")
-    
-    try:
-        content = await file.read()
-        cookies_path = "cookies.txt"
-        
-        # Try to decode as text first
+        # Test ffmpeg
+        import subprocess
         try:
-            text_content = content.decode('utf-8')
-        except UnicodeDecodeError:
-            # If UTF-8 fails, try other encodings
-            try:
-                text_content = content.decode('latin-1')
-            except UnicodeDecodeError:
-                raise HTTPException(status_code=400, detail="Unable to decode cookie file. Please ensure it's a valid text file.")
+            ffmpeg_result = subprocess.run(['ffmpeg', '-version'], capture_output=True, timeout=10)
+            ffmpeg_available = ffmpeg_result.returncode == 0
+        except:
+            ffmpeg_available = False
         
-        # Validate cookies content
-        if not validate_cookies_content(text_content):
-            raise HTTPException(status_code=400, detail="Invalid cookie format. Please ensure you're uploading a valid cookies.txt file from your browser.")
-        
-        # Write cookies file
-        with open(cookies_path, 'w', encoding='utf-8') as f:
-            f.write(text_content)
-        
-        # Basic stats for user feedback
-        lines = text_content.strip().split('\n')
-        cookie_count = len([line for line in lines if line.strip() and not line.startswith('#')])
+        # Test ffprobe
+        try:
+            ffprobe_result = subprocess.run(['ffprobe', '-version'], capture_output=True, timeout=10)
+            ffprobe_available = ffprobe_result.returncode == 0
+        except:
+            ffprobe_available = False
         
         return {
-            "message": "Cookies uploaded successfully", 
-            "path": cookies_path,
-            "cookie_count": cookie_count
+            "status": "healthy",
+            "downloads_dir": str(DOWNLOADS_DIR.absolute()),
+            "temp_dir": str(TEMP_DIR.absolute()),
+            "downloads_writable": downloads_writable,
+            "temp_writable": temp_writable,
+            "ffmpeg_available": ffmpeg_available,
+            "ffprobe_available": ffprobe_available,
+            "active_tasks": len(tasks),
+            "python_version": f"{os.sys.version_info.major}.{os.sys.version_info.minor}.{os.sys.version_info.micro}"
         }
-    
+    except Exception as e:
+        return {
+            "status": "unhealthy",
+            "error": str(e)
+        }
+
+@app.post("/api/upload-cookies")
+async def upload_cookies(cookies: UploadFile = File(...)):
+    """Upload cookies.txt file for private/age-restricted videos"""
+    try:
+        if not cookies.filename or not cookies.filename.endswith('.txt'):
+            raise HTTPException(status_code=400, detail="Only .txt files are allowed")
+        
+        if cookies.size and cookies.size > 1024 * 1024:  # 1MB limit
+            raise HTTPException(status_code=400, detail="File too large (max 1MB)")
+        
+        cookies_path = Path("cookies.txt")
+        async with aiofiles.open(cookies_path, 'wb') as f:
+            content = await cookies.read()
+            await f.write(content)
+        
+        # Validate the uploaded cookies
+        downloader = VideoDownloader()
+        validation_result = downloader.validate_cookies_file()
+        
+        if validation_result["valid"]:
+            return {
+                "message": "Cookies uploaded and validated successfully! This will help access private or age-restricted videos.",
+                "validation": validation_result
+            }
+        else:
+            return {
+                "message": "Cookies uploaded but validation failed. The file may not work properly.",
+                "validation": validation_result,
+                "help": [
+                    "To export proper cookies.txt:",
+                    "1. Install a browser extension like 'Get cookies.txt LOCALLY'",
+                    "2. Go to youtube.com and make sure you're logged in",
+                    "3. Use the extension to export cookies for youtube.com",
+                    "4. Upload the resulting cookies.txt file"
+                ]
+            }
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to upload cookies: {str(e)}")
 
-@app.get("/health")
-async def health_check():
-    """Health check endpoint for Render"""
-    return {"status": "OK", "message": "YouTube Video Downloader API is running"}
-
-@app.get("/")
-async def root():
-    """Root endpoint"""
-    return {"message": "YouTube Video Downloader API", "version": "1.0.0"}
-
-@app.get("/api/test-cookies")
-async def test_cookies():
-    """Test if cookies file exists and is valid"""
+@app.post("/api/download", response_model=DownloadResponse)
+async def start_download(request: DownloadRequest, background_tasks: BackgroundTasks):
+    """Start video download process"""
     try:
-        cookies_path = "cookies.txt"
-        if not os.path.exists(cookies_path):
-            return {"valid": False, "message": "No cookies file found"}
+        # Get client IP for rate limiting
+        # In production, this would be from request.client.host, but we'll use a simple approach
+        import time
+        current_time = time.time()
         
-        with open(cookies_path, 'r', encoding='utf-8') as f:
-            content = f.read()
+        # Check for too frequent requests (help prevent getting banned)
+        if 'global' in last_request_time:
+            time_since_last = current_time - last_request_time['global']
+            if time_since_last < REQUEST_COOLDOWN:
+                remaining = REQUEST_COOLDOWN - time_since_last
+                raise HTTPException(
+                    status_code=429, 
+                    detail=f"Please wait {remaining:.1f} seconds before starting another download. This helps prevent YouTube from blocking our service."
+                )
         
-        if not validate_cookies_content(content):
-            return {"valid": False, "message": "Invalid cookie format"}
+        last_request_time['global'] = current_time
         
-        lines = content.strip().split('\n')
-        cookie_count = len([line for line in lines if line.strip() and not line.startswith('#')])
+        # Validate URL
+        if not request.url or not request.url.strip():
+            raise HTTPException(status_code=400, detail="URL is required")
+        
+        # Basic YouTube URL validation
+        youtube_patterns = [
+            "youtube.com/watch",
+            "youtu.be/",
+            "youtube.com/embed/",
+            "youtube.com/v/",
+            "m.youtube.com/watch"
+        ]
+        
+        if not any(pattern in request.url for pattern in youtube_patterns):
+            raise HTTPException(status_code=400, detail="Please provide a valid YouTube URL")
+        
+        task_id = str(uuid.uuid4())[:12]
+        
+        # Initialize task status
+        tasks[task_id] = {
+            "status": "processing",
+            "progress": "starting",
+            "message": "Initializing download...",
+            "videoInfo": None,
+            "filename": None,
+            "url": request.url,
+            "rename": request.rename
+        }
+        
+        # Start background download task
+        background_tasks.add_task(download_video_task, task_id, request.url, request.rename)
+        
+        return DownloadResponse(
+            taskId=task_id,
+            status="processing",
+            message="Download started successfully"
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to start download: {str(e)}")
+
+@app.get("/api/status/{task_id}", response_model=StatusResponse)
+async def get_status(task_id: str):
+    """Get download status for a task"""
+    if task_id not in tasks:
+        raise HTTPException(status_code=404, detail="Task not found")
+    
+    task = tasks[task_id]
+    return StatusResponse(
+        status=task["status"],
+        filename=task.get("filename"),
+        message=task.get("message"),
+        videoInfo=task.get("videoInfo"),
+        progress=task.get("progress")
+    )
+
+@app.get("/files/{task_id}.mkv")
+async def download_file(task_id: str):
+    """Download the converted video file"""
+    file_path = DOWNLOADS_DIR / f"{task_id}.mkv"
+    
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="File not found or has been cleaned up")
+    
+    return FileResponse(
+        path=file_path,
+        media_type="video/x-matroska",
+        filename=f"{task_id}.mkv",
+        headers={"Content-Disposition": f"attachment; filename={task_id}.mkv"}
+    )
+
+@app.delete("/api/cleanup/{task_id}")
+async def cleanup_task(task_id: str):
+    """Clean up task and associated files"""
+    try:
+        # Remove from tasks
+        if task_id in tasks:
+            del tasks[task_id]
+        
+        # Remove files
+        file_path = DOWNLOADS_DIR / f"{task_id}.mkv"
+        if file_path.exists():
+            file_path.unlink()
+        
+        # Remove temp files
+        for temp_file in TEMP_DIR.glob(f"{task_id}_temp.*"):
+            temp_file.unlink()
+        
+        return {"message": "Task cleaned up successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Cleanup failed: {str(e)}")
+
+@app.get("/api/anti-bot-info")
+async def get_anti_bot_info():
+    """Get information about the anti-bot measures"""
+    return {
+        "version": "Conservative Anti-Bot v2.0",
+        "approach": "Ultra-conservative timing to avoid YouTube detection",
+        "timing_details": {
+            "request_cooldown": f"{REQUEST_COOLDOWN} seconds between downloads",
+            "extraction_delay": "10-20 seconds base + 10s per retry",
+            "download_delay": "15-30 seconds base + 15s per retry", 
+            "anti_bot_wait": "30-60 seconds base + 30s per retry",
+            "strategy_wait": "30-60 seconds between fallback strategies"
+        },
+        "recommendations": [
+            "🎯 NEW ULTRA-CONSERVATIVE APPROACH:",
+            "• Downloads now take 3-10+ minutes to complete",
+            "• This dramatically reduces detection probability", 
+            "• Each step has intentional delays to mimic human behavior",
+            "",
+            "⏰ Timing Expectations:",
+            "• Extraction: 1-3 minutes",
+            "• Download: 2-5 minutes", 
+            "• Conversion: 1-2 minutes",
+            "• Total time: 4-10 minutes per video",
+            "",
+            "🛡️ Anti-Detection Features:",
+            "• 2-minute cooldown between requests",
+            "• Randomized delays at every step",
+            "• Progressive backoff on failures",
+            "• Browser-specific headers and user agents",
+            "• Automatic browser cookie extraction",
+            "",
+            "📋 Best Practices:",
+            "• Don't start multiple downloads simultaneously",
+            "• Wait at least 10-15 minutes between failed attempts",
+            "• Upload fresh cookies.txt if available",
+            "• Try public videos first to test functionality"
+        ],
+        "current_status": {
+            "active_downloads": len([t for t in tasks.values() if t.get("status") == "processing"]),
+            "last_request": max(last_request_time.values()) if last_request_time else None,
+            "cooldown_active": (
+                (time.time() - max(last_request_time.values())) < REQUEST_COOLDOWN 
+                if last_request_time else False
+            )
+        }
+    }
+
+@app.get("/api/browser-cookies")
+async def get_browser_cookies_info():
+    """Get information about available browser cookies"""
+    try:
+        downloader = VideoDownloader()
         
         return {
-            "valid": True, 
-            "message": "Cookies file is valid",
-            "cookie_count": cookie_count
+            "detected_browsers": downloader.detected_browsers,
+            "recommendations": [
+                "Browser cookie extraction works best with:",
+                "1. Chrome/Chromium (most reliable)",
+                "2. Firefox (good compatibility)",
+                "3. Edge (Windows users)",
+                "",
+                "To enable browser cookie extraction:",
+                "1. Make sure you're logged into YouTube in your browser",
+                "2. Close all browser instances before starting downloads",
+                "3. The API will automatically extract cookies from your browser",
+                "",
+                "If browser extraction fails, upload cookies.txt as a fallback."
+            ],
+            "browser_status": {
+                browser: "Available" for browser in downloader.detected_browsers
+            } if downloader.detected_browsers else {"none": "No browsers detected"}
         }
-    
     except Exception as e:
-        return {"valid": False, "message": f"Error reading cookies: {str(e)}"}
+        return {
+            "error": f"Failed to get browser info: {str(e)}",
+            "detected_browsers": [],
+            "recommendations": [
+                "Browser detection failed - please upload cookies.txt manually"
+            ]
+        }
 
-def validate_cookies_content(content: str) -> bool:
-    """Validate if cookies content looks valid"""
+@app.get("/api/troubleshoot")
+async def get_troubleshoot_info():
+    """Get troubleshooting information for debugging YouTube access issues"""
     try:
-        # Check for common cookie patterns
-        if 'youtube.com' in content.lower() or 'google.com' in content.lower():
-            return True
-        # Check for Netscape cookie format
-        if content.strip().startswith('# Netscape HTTP Cookie File'):
-            return True
-        # Check for cookie entries (basic validation)
-        lines = content.strip().split('\n')
-        for line in lines:
-            if line.strip() and not line.startswith('#'):
-                parts = line.split('\t')
-                if len(parts) >= 6:  # Basic cookie format check
-                    return True
-        return False
-    except:
-        return False
+        import yt_dlp
+        from datetime import datetime
+        
+        # Check yt-dlp version
+        yt_dlp_version = yt_dlp.__version__
+        
+        # Check browser cookies
+        downloader = VideoDownloader()
+        browser_info = {
+            "detected_browsers": downloader.detected_browsers,
+            "available": len(downloader.detected_browsers) > 0
+        }
+        
+        # Check and validate cookies file
+        cookies_validation = downloader.validate_cookies_file()
+        
+        # Check ffmpeg availability
+        try:
+            ffmpeg_result = subprocess.run(['ffmpeg', '-version'], capture_output=True, timeout=10)
+            ffmpeg_available = ffmpeg_result.returncode == 0
+            ffmpeg_version = ffmpeg_result.stdout.decode().split('\n')[0] if ffmpeg_available else "Not available"
+        except:
+            ffmpeg_available = False
+            ffmpeg_version = "Not available"
+        
+        # Get current task statistics
+        task_stats = {
+            "total_tasks": len(tasks),
+            "processing_tasks": len([t for t in tasks.values() if t.get("status") == "processing"]),
+            "ready_tasks": len([t for t in tasks.values() if t.get("status") == "ready"]),
+            "error_tasks": len([t for t in tasks.values() if t.get("status") == "error"]),
+        }
+        
+        # Recent errors
+        recent_errors = []
+        for task_id, task in tasks.items():
+            if task.get("status") == "error":
+                recent_errors.append({
+                    "task_id": task_id,
+                    "message": task.get("message", "Unknown error"),
+                    "url": task.get("url", "Unknown")
+                })
+        
+        return {
+            "timestamp": datetime.now().isoformat(),
+            "yt_dlp_version": yt_dlp_version,
+            "browser_cookies": browser_info,
+            "file_cookies": cookies_validation,
+            "ffmpeg": {
+                "available": ffmpeg_available,
+                "version": ffmpeg_version
+            },
+            "task_statistics": task_stats,
+            "recent_errors": recent_errors[-5:],  # Last 5 errors
+            "recommendations": [
+                "🆕 ULTRA-CONSERVATIVE ANTI-BOT v2.0:",
+                "• This version uses dramatically longer delays (minutes, not seconds)",
+                "• Downloads now take 4-10+ minutes but have much higher success rates",
+                "• 2-minute mandatory cooldown between download requests",
+                "• Automatic browser cookie extraction + uploaded cookies.txt fallback",
+                "",
+                "⏰ New Timing Expectations:",
+                "• Each download attempt: 1-3 minutes",
+                "• Anti-bot failures: 30-60 second delays", 
+                "• Strategy fallbacks: 30-60 seconds between attempts",
+                "• Total download time: 4-10 minutes per video",
+                "",
+                "If you're still getting 'Sign in to confirm you're not a bot' errors:",
+                "1. Wait at least 15-30 minutes between failed attempts",
+                "2. Try uploading the freshest possible cookies.txt",
+                "3. Test with different, simpler videos first",
+                "4. Check /api/anti-bot-info for detailed timing info",
+                "5. The longer delays are intentional - please be patient",
+                "",
+                "🎯 Success Tips:",
+                "• Start with popular, public videos",
+                "• Don't run multiple downloads simultaneously",
+                "• Upload cookies from an actively logged-in browser session",
+                "• Consider the 2-minute cooldown helps prevent service-wide bans"
+            ]
+        }
+    except Exception as e:
+        return {
+            "error": f"Failed to get troubleshoot info: {str(e)}",
+            "timestamp": datetime.now().isoformat()
+        }
+
+async def download_video_task(task_id: str, url: str, rename: Optional[str] = None):
+    """Background task to download and convert video with enhanced error handling"""
+    downloader = VideoDownloader()
+    
+    try:
+        # Update status: extracting
+        tasks[task_id]["progress"] = "extracting"
+        tasks[task_id]["message"] = "🔍 Extracting video information (using conservative anti-bot approach - this may take longer)..."
+        
+        # Extract video info with fallback strategies
+        try:
+            # First try standard extraction
+            try:
+                video_info = await downloader.extract_info(url)
+            except Exception as e:
+                if "blocked" in str(e).lower() or "bot" in str(e).lower():
+                    # Try fallback strategies
+                    tasks[task_id]["message"] = "Standard extraction failed, trying alternative methods..."
+                    video_info = await downloader.extract_info_with_fallback(url)
+                else:
+                    raise e
+                    
+        except Exception as e:
+            error_msg = str(e)
+            if "video access blocked" in error_msg.lower() or "bot" in error_msg.lower():
+                tasks[task_id]["message"] = f"❌ YouTube anti-bot protection triggered.\n\n💡 Solutions:\n• This version uses much longer delays (2-5+ minutes per attempt)\n• Wait at least 10-15 minutes before trying again\n• Try uploading fresh cookies.txt from a logged-in browser session\n• Consider trying a different video first\n• The service enforces 2-minute cooldowns between downloads"
+            elif "access forbidden" in error_msg.lower():
+                tasks[task_id]["message"] = f"❌ Access forbidden.\n\n💡 This video may be:\n• Region-locked\n• Private or unlisted\n• Require authentication\n\nTry uploading cookies.txt from a logged-in session."
+            elif "video not found" in error_msg.lower():
+                tasks[task_id]["message"] = f"❌ Video not found.\n\n💡 Please check:\n• The URL is correct\n• The video hasn't been deleted\n• The video isn't private"
+            elif "max retries exceeded" in error_msg.lower():
+                tasks[task_id]["message"] = f"❌ Multiple attempts failed.\n\n💡 YouTube is actively blocking requests. Please:\n• Wait 10-15 minutes before trying again\n• Upload fresh cookies.txt\n• Try a different video"
+            else:
+                tasks[task_id]["message"] = f"❌ Extraction failed: {error_msg}"
+            
+            tasks[task_id]["status"] = "error"
+            raise
+        
+        if not video_info:
+            raise Exception("Could not extract video information")
+        
+        tasks[task_id]["videoInfo"] = {
+            "title": video_info.get("title", "Unknown"),
+            "thumbnail": video_info.get("thumbnail", ""),
+            "duration": format_duration(video_info.get("duration", 0))
+        }
+        
+        # Update status: downloading
+        tasks[task_id]["progress"] = "downloading"
+        tasks[task_id]["message"] = f"Downloading: {video_info.get('title', 'Unknown')}"
+        
+        # Download video
+        try:
+            temp_file = await downloader.download_video(url, task_id)
+        except Exception as e:
+            error_msg = str(e)
+            if "youtube is blocking" in error_msg.lower() or "bot" in error_msg.lower():
+                tasks[task_id]["message"] = f"❌ YouTube is blocking the download.\n\n💡 Solutions:\n• Upload a valid cookies.txt file\n• Wait 10-15 minutes before retrying\n• Try a different video"
+            elif "access forbidden" in error_msg.lower():
+                tasks[task_id]["message"] = f"❌ Download forbidden.\n\n💡 This video may be:\n• Region-locked\n• Private or require authentication\n• Age-restricted\n\nTry uploading cookies.txt from a logged-in session."
+            elif "video not found" in error_msg.lower():
+                tasks[task_id]["message"] = f"❌ Video not found during download.\n\n💡 The video may have been:\n• Deleted or made private\n• Moved to a different URL"
+            elif "private video" in error_msg.lower():
+                tasks[task_id]["message"] = f"❌ This is a private video.\n\n💡 You need to upload cookies.txt from a browser session where you're logged in and have access to this video."
+            elif "max retries exceeded" in error_msg.lower():
+                tasks[task_id]["message"] = f"❌ Download failed after multiple attempts.\n\n💡 YouTube is actively blocking requests. Please:\n• Wait 15-30 minutes before trying again\n• Upload fresh cookies.txt\n• Check if the video is still available"
+            else:
+                tasks[task_id]["message"] = f"❌ Download failed: {error_msg}"
+            
+            tasks[task_id]["status"] = "error"
+            raise
+        
+        if not temp_file or not temp_file.exists():
+            raise Exception("Download failed - no file created")
+        
+        # Update status: converting
+        tasks[task_id]["progress"] = "converting"
+        tasks[task_id]["message"] = "Converting video to optimized format..."
+        
+        # Convert to HEVC/H.264
+        output_file = DOWNLOADS_DIR / f"{task_id}.mkv"
+        try:
+            await downloader.convert_to_hevc(temp_file, output_file)
+        except Exception as e:
+            error_msg = str(e)
+            if "hevc encoder" in error_msg.lower():
+                tasks[task_id]["message"] = "⚠️ HEVC not available, using H.264 instead..."
+                # The downloader will handle fallback automatically
+            else:
+                tasks[task_id]["message"] = f"❌ Conversion failed: {error_msg}"
+                tasks[task_id]["status"] = "error"
+                raise
+        
+        if not output_file.exists() or output_file.stat().st_size == 0:
+            raise Exception("Conversion failed - no output file created")
+        
+        # Clean up temp file
+        if temp_file.exists():
+            temp_file.unlink()
+        
+        # Update status: ready
+        tasks[task_id]["status"] = "ready"
+        tasks[task_id]["progress"] = "ready"
+        tasks[task_id]["message"] = "✅ Video ready for download!"
+        tasks[task_id]["filename"] = f"{task_id}.mkv"
+        
+        print(f"Download completed successfully for task {task_id}")
+        
+    except Exception as e:
+        if tasks[task_id]["status"] != "error":
+            tasks[task_id]["status"] = "error"
+            if not tasks[task_id].get("message", "").startswith("❌"):
+                tasks[task_id]["message"] = f"❌ Error: {str(e)}"
+        
+        print(f"Download error for task {task_id}: {str(e)}")
+        
+        # Clean up any temp files on error
+        try:
+            for temp_file in TEMP_DIR.glob(f"{task_id}_temp.*"):
+                temp_file.unlink()
+        except:
+            pass
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 10000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
